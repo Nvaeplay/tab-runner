@@ -168,26 +168,28 @@ let resumeTimer = null;
  * Try to start playback, retrying while the page finishes loading. A tab that
  * has been sitting in the background for hours may have been discarded and is
  * still re-rendering when we arrive.
+ *
+ * `force` means the runner deliberately moved here, so start the video whatever
+ * state it is in. Without it we only take over playback we are entitled to -
+ * a video the user paused on purpose stays paused when they wander back to it.
  */
-function requestResume(attempt = 0) {
+function requestResume(attempt = 0, force = false) {
   clearTimeout(resumeTimer);
 
   const video = mainVideo();
   if (video) {
-    // Only take over playback we are entitled to: either we paused it when the
-    // user walked away, or it has never been started. A video the user paused
-    // on purpose halfway through stays paused.
+    if (!video.paused) return;
     const neverStarted = video.currentTime === 0;
-    if (video.paused && (pausedByUs || neverStarted)) {
+    if (force || pausedByUs || neverStarted) {
       pausedByUs = false;
       playWithAutoplayFallback(video);
       return;
     }
-    if (!video.paused) return;
+    return;
   }
 
   if (attempt < 12) {
-    resumeTimer = setTimeout(() => requestResume(attempt + 1), 750);
+    resumeTimer = setTimeout(() => requestResume(attempt + 1, force), 750);
   }
 }
 
@@ -203,11 +205,20 @@ document.addEventListener('visibilitychange', () => {
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === 'resume') {
-    if (settings.autoplayNext) requestResume();
+    if (settings.autoplayNext) requestResume(0, Boolean(message.force));
     sendResponse({ ok: true });
   }
   if (message?.type === 'silence-status') {
     sendResponse(SilenceSkip.status());
+  }
+  if (message?.type === 'has-video') {
+    // Only a video with actual media behind it counts. An empty <video> element
+    // - YouTube's home page keeps one around for hover previews - is not
+    // something worth stopping the queue on.
+    const video = mainVideo();
+    sendResponse({
+      hasVideo: Boolean(video && (video.readyState > 0 || video.currentSrc)),
+    });
   }
   return false;
 });

@@ -18,6 +18,8 @@ function assertEquals(actual, expected, msg) {
   }
 }
 
+import { DEFAULTS } from '../settings.js';
+
 const src = await Deno.readTextFile(new URL('../silence-skip.js', import.meta.url));
 const SilenceSkip = new Function(`${src}\nreturn SilenceSkip;`)();
 const createDecider = SilenceSkip._createDecider;
@@ -148,6 +150,50 @@ Deno.test('aggressive sensitivity skips less than cautious', () => {
   // A 17 dB drop clears the aggressive (9 dB) bar but not the cautious (20 dB) one.
   assertEquals(cautious, 0);
   assert(aggressive > 3000, `expected aggressive to engage, got ${aggressive}ms`);
+});
+
+// The shipped defaults, so these test what users actually get rather than a
+// hand-picked configuration.
+const SHIPPED = {
+  silenceMarginDb: DEFAULTS.silenceMarginDb,
+  silenceHoldMs: DEFAULTS.silenceHoldMs,
+};
+
+Deno.test('the shipped threshold is slow enough not to flicker', () => {
+  assert(
+    DEFAULTS.silenceHoldMs >= 1000,
+    `default hold is ${DEFAULTS.silenceHoldMs}ms - short holds make the rate ` +
+      'change on every breath between sentences, which reads as glitchy playback'
+  );
+});
+
+Deno.test('at the shipped default, ordinary speech pauses never change speed', () => {
+  // 1.8s gaps: long for a sentence break, well short of real dead air.
+  const segments = [{ db: -25, ms: 6000 }];
+  for (let i = 0; i < 6; i++) segments.push({ db: -70, ms: 1800 }, { db: -25, ms: 2000 });
+  const trace = run(segments, SHIPPED);
+  assertEquals(
+    fastMsBetween(trace, 6000, 30000),
+    0,
+    'pauses shorter than the threshold must not trigger a speed change'
+  );
+});
+
+Deno.test('at the shipped default, real dead air still gets sped up', () => {
+  const trace = run(
+    [
+      { db: -25, ms: 6000 },
+      { db: -70, ms: 8000 },
+      { db: -25, ms: 2000 },
+    ],
+    SHIPPED
+  );
+  const during = fastMsBetween(trace, 6000, 14000);
+  const expected = 8000 - DEFAULTS.silenceHoldMs;
+  assert(
+    during > expected - 400,
+    `expected roughly ${expected}ms fast in an 8s gap, got ${during}`
+  );
 });
 
 Deno.test('reset clears learned loudness so a new video starts fresh', () => {

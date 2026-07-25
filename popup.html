@@ -36,6 +36,10 @@
         <input type="checkbox" id="wrapAround" />
         <span>Wrap back to the first tab at the end</span>
       </label>
+      <label class="check">
+        <input type="checkbox" id="skipTabsWithoutVideo" />
+        <span>Skip past tabs with no video (never closes them)</span>
+      </label>
 
       <label class="field">
         <span>Wait before closing</span>
@@ -74,6 +78,19 @@
             <option value="2">2×</option>
             <option value="2.5">2.5×</option>
             <option value="3">3×</option>
+          </select>
+        </span>
+      </label>
+      <label class="field">
+        <span>After this much quiet</span>
+        <span class="input">
+          <select id="silenceHoldMs">
+            <option value="500">0.5 s</option>
+            <option value="1000">1 s</option>
+            <option value="2000">2 s</option>
+            <option value="3000">3 s</option>
+            <option value="5000">5 s</option>
+            <option value="8000">8 s</option>
           </select>
         </span>
       </label>

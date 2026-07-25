@@ -51,6 +51,12 @@ won't re-force it when you seek. Pitch is preserved, so 1.75× doesn't chipmunk.
 **Speed up further while nobody is talking** — multiplies whatever rate is in
 effect during quiet stretches, and drops back the instant sound returns.
 
+**After this much quiet** (default 3 s) — how long silence must last before the
+speed-up kicks in. This is a feel control more than a savings one: at a few
+hundred milliseconds the rate changes on every breath between sentences, which
+reads as glitchy playback rather than as speed. Three seconds means only real
+dead air qualifies.
+
 ### How much this actually saves
 
 Reproduce with:
@@ -63,19 +69,26 @@ That drives the shipped decision logic against two synthetic 20-minute audio
 profiles. These are model numbers meant to show the shape of the tradeoff, not a
 promise about your particular backlog:
 
+At the default 3-second threshold:
+
 | Base speed | Silence skipping | Well-edited talk | Rambly screencast |
 | --- | --- | --- | --- |
 | Normal | off | — | — |
-| Normal | 2× | 7% | 12% |
+| Normal | 2× | 2% | 4% |
 | 1.5× | off | 33% | 33% |
-| 1.5× | 2× | 38% | 42% |
-| 1.75× | 2× | 47% | 50% |
-| 2× | 2× | 53% | 56% |
+| 1.5× | 2× | 35% | 36% |
+| 1.75× | 2× | 44% | 45% |
+| 2× | 2× | 51% | 52% |
 
-The honest read: **silence skipping is the smaller lever.** A well-edited talk is
-only ~13% silence, and playing that silence at 2× recovers half of it — so ~7%.
-Raising the base rate is where the time is. Silence skipping is worth turning on
-because it stacks on top for free, not because it carries the feature.
+The honest read: **silence skipping is the smaller lever, and the 3-second
+threshold makes it smaller still.** Requiring three seconds of quiet excludes
+every between-sentence pause, which is most of the silence in a talk — only 4–8%
+of runtime ends up sped. Dropping the threshold to 1 s roughly doubles the
+contribution, at the cost of the rate visibly flickering during natural speech
+gaps.
+
+Raising the base rate is where the time actually is. Silence skipping is worth
+having because it stacks on top for free, not because it carries the feature.
 
 Speed during silence is capped at 4×. Speech resumption is detected one frame
 late, so at rate R you rush through R × ~16 ms of real video before dropping
@@ -91,9 +104,37 @@ All in the popup:
 - **Pause a video when I switch away from it** — stops two things playing at once.
 - **Wrap back to the first tab at the end** — makes the window a loop instead of
   a queue.
+- **Skip past tabs with no video** — steps over tabs with nothing to play instead
+  of stalling on them. Never closes anything. On by default.
 - **Wait before closing** (default 1200 ms) — grace period between the video
   ending and the tab closing.
 - **Ignore videos shorter than** (default 15 s) — filters out bumpers and stings.
+
+## Skipping tabs with no video
+
+Open tabs faster than you can read them and you end up with strays: a new tab
+page you never typed into, a docs page, a YouTube home page. They have nothing to
+play, so the queue used to stall on them.
+
+The runner now steps *over* them. **Nothing is closed** — skipped tabs stay
+exactly where they are, and you can go back to them whenever. On by default,
+since it only changes where the runner lands.
+
+A tab is only skipped when it can be **proven** to have no video, because
+skipping something watchable silently drops it from the queue. So:
+
+- Pages no content script can run in — `chrome://`, `about:blank`, the Web Store,
+  the PDF viewer — genuinely cannot play anything, and are skipped.
+- Ordinary pages are asked directly whether they hold a video with real media
+  behind it. An empty `<video>` element (YouTube's home page keeps one for hover
+  previews) doesn't count.
+- **Discarded or still-loading tabs are never skipped.** No content script is
+  running to ask, and the tab may well hold a video once it wakes up. In a large
+  pile these are common, so guessing would drop half the queue.
+- A page that should be reachable but isn't gets stopped at, not skipped.
+
+If everything ahead is videoless the runner stops and shows ✓ rather than
+depositing you on a blank tab. One advance looks ahead at most 25 tabs.
 
 ## Getting tabs back
 
@@ -119,9 +160,10 @@ Things that are deliberate rather than incidental:
 - **Grabbing the wheel cancels the close.** During the grace period, if you
   switch tabs or the tab is no longer in front, the runner stands down rather
   than closing something you just moved to.
-- **The runner won't un-pause a video you paused on purpose.** It only starts
-  playback it's entitled to: a video that has never been started, or one the
-  runner itself paused when you switched away.
+- **Arriving at a tab starts its video, whatever state it was left in** — that's
+  the point of the runner. But a plain tab switch doesn't: if you paused
+  something on purpose and later wander back to it by hand, it stays paused.
+  Only a deliberate advance forces playback.
 - **`ended` is caught in the capture phase on `document`.** The event doesn't
   bubble, but a capturing listener still sees it. This survives SPA navigation
   and players that swap out their `<video>` element, which a direct listener on

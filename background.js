@@ -11,6 +11,10 @@ import { DEFAULTS } from './settings.js';
 
 const ADVANCE_COOLDOWN_MS = 4000;
 
+// Ceiling on how far one advance will look ahead for a tab with a video, so a
+// window full of videoless tabs cannot turn into a long scan.
+const MAX_SKIPS = 25;
+
 // Tab id -> timestamp of the last advance we started for it. Guards against
 // duplicate `ended` events (multiple frames, YouTube re-firing on seek).
 const recentAdvances = new Map();
@@ -51,17 +55,54 @@ async function tell(tabId, message) {
 }
 
 /**
- * Pick the tab to move to: nearest tab to the right that is not pinned.
- * Returns null when the current tab is the last one and wrap-around is off.
+ * Can this tab be *proven* to have no video? Only then is it safe to skip.
+ *
+ * The bias is deliberate: skipping a tab that did have something to watch means
+ * silently losing it from the queue, so anything we cannot inspect counts as
+ * "might have video" and gets stopped at.
  */
-function pickNextTab(tabs, current, wrapAround) {
+async function tabHasVideo(tab) {
+  // Discarded or still loading: no content script is running to ask, and the
+  // tab may well hold a video once it wakes up. In a large pile these are
+  // common, so guessing here would skip half the queue.
+  if (tab.discarded || tab.status === 'unloaded' || tab.status === 'loading') return true;
+
+  // Pages no content script can run in - chrome://, about:blank, the Web Store,
+  // the PDF viewer. These genuinely cannot be playing anything.
+  if (!/^https?:/i.test(tab.url || '')) return false;
+
+  const reply = await chrome.tabs.sendMessage(tab.id, { type: 'has-video' }).catch(() => null);
+  // Unreachable despite being an ordinary page: assume it might, and stop.
+  if (!reply) return true;
+  return Boolean(reply.hasVideo);
+}
+
+/**
+ * Walk right to the next tab worth stopping on, stepping over tabs with nothing
+ * to play rather than stalling on them.
+ *
+ * Returns null when there is nowhere left to go - including when everything
+ * ahead is videoless, in which case the runner stops rather than depositing you
+ * on a blank tab.
+ */
+async function pickNextStop(tabs, current, state) {
   const ordered = [...tabs].sort((a, b) => a.index - b.index);
   const eligible = ordered.filter((t) => t.id !== current.id && !t.pinned);
   if (eligible.length === 0) return null;
 
-  const toTheRight = eligible.find((t) => t.index > current.index);
-  if (toTheRight) return toTheRight;
-  return wrapAround ? eligible[0] : null;
+  const rightward = eligible.filter((t) => t.index > current.index);
+  const order = state.wrapAround
+    ? [...rightward, ...eligible.filter((t) => t.index < current.index)]
+    : rightward;
+
+  if (!state.skipTabsWithoutVideo) return order[0] ?? null;
+
+  let looked = 0;
+  for (const candidate of order) {
+    if (++looked > MAX_SKIPS) return candidate;
+    if (await tabHasVideo(candidate)) return candidate;
+  }
+  return null;
 }
 
 async function recordClosed(tab, state) {
@@ -98,7 +139,7 @@ async function advance(tab, { close, delay = 0 }) {
   }
 
   const tabs = await chrome.tabs.query({ windowId: tab.windowId });
-  const next = pickNextTab(tabs, tab, state.wrapAround);
+  const next = await pickNextStop(tabs, tab, state);
 
   if (!next) {
     // End of the queue. Leave the last tab open - closing it would take the
@@ -116,7 +157,10 @@ async function advance(tab, { close, delay = 0 }) {
   }
 
   if (state.autoplayNext) {
-    await tell(next.id, { type: 'resume' });
+    // force: the runner chose to come here, so start the video whatever state
+    // it was left in. Plain tab switches do not force, so a video you paused on
+    // purpose stays paused when you wander back to it.
+    await tell(next.id, { type: 'resume', force: true });
   }
 
   await updateBadge();

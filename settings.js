@@ -27,12 +27,19 @@ export const DEFAULTS = {
   autoplayNext: true,
   historyLimit: 60,
 
+  // Step over tabs with nothing to play instead of stalling on them. On by
+  // default: it only changes where the runner lands, it never closes anything.
+  skipTabsWithoutVideo: true,
+
   // Speed
   defaultRate: 1,
   skipSilence: false,
   silenceMultiplier: 2,
   silenceMarginDb: 14,
-  silenceHoldMs: 350,
+  // How long the quiet has to last before speeding up. Short values make the
+  // rate flicker on every between-sentence breath, which reads as glitchy
+  // playback, so this is deliberately slow by default.
+  silenceHoldMs: 3000,
   showSpeedBadge: true,
 };
 
@@ -49,11 +56,13 @@ export const SETTING_CONTROLS = {
   autoplayNext: 'checkbox',
   pauseOnLeave: 'checkbox',
   wrapAround: 'checkbox',
+  skipTabsWithoutVideo: 'checkbox',
   closeDelayMs: 'number',
   minDurationSec: 'number',
   defaultRate: 'number',
   skipSilence: 'checkbox',
   silenceMultiplier: 'number',
+  silenceHoldMs: 'number',
   silenceMarginDb: 'number',
   showSpeedBadge: 'checkbox',
 };

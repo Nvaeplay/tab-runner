@@ -41,10 +41,14 @@ function lectureProfile(minutes, longPauseEvery) {
   return out;
 }
 
+// Matches the shipped defaults in settings.js.
+const SILENCE_MARGIN_DB = 14;
+const SILENCE_HOLD_MS = 3000;
+
 function simulate(profile, baseRate, multiplier) {
   const decider = SilenceSkip._createDecider(() => ({
-    silenceMarginDb: 14,
-    silenceHoldMs: 350,
+    silenceMarginDb: SILENCE_MARGIN_DB,
+    silenceHoldMs: SILENCE_HOLD_MS,
   }));
   let now = 0;
   let realMs = 0; // wall-clock time you spend watching
@@ -69,10 +73,12 @@ const profiles = [
   ['Rambly screencast', lectureProfile(20, 3)],
 ];
 
+console.log(`Silence must last ${SILENCE_HOLD_MS / 1000}s before speeding up (the default).`);
+
 for (const [label, profile] of profiles) {
   const probe = simulate(profile, 1, 2);
   const quietPct = ((probe.quietMs / probe.videoMs) * 100).toFixed(0);
-  console.log(`\n${label} - 20 min, ${quietPct}% detected as quiet\n`);
+  console.log(`\n${label} - 20 min, ${quietPct}% spent sped up\n`);
   console.log('  base    silence   watched    saved');
   console.log('  ------  --------  ---------  -------');
 
