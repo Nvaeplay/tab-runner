@@ -1,0 +1,22 @@
+# Packaged extension builds
+*.zip
+*.crx
+*.pem
+dist/
+
+# Tooling that may show up later
+node_modules/
+deno.lock
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local Claude Code config (machine-specific permissions)
+.claude/settings.local.json

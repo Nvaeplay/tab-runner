@@ -1,0 +1,5 @@
+# Normalise to LF in the repo so diffs stay clean across machines.
+* text=auto eol=lf
+
+# Binary
+*.png binary

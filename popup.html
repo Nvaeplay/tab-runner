@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" href="popup.css" />
+    <title>Tab Runner</title>
+  </head>
+  <body>
+    <header>
+      <h1>Tab Runner</h1>
+      <p id="status" class="status">Checking…</p>
+    </header>
+
+    <button id="toggle" class="primary">Run this window</button>
+
+    <div class="row">
+      <button id="advance-close" class="ghost">Done → next</button>
+      <button id="advance-keep" class="ghost">Skip → next</button>
+    </div>
+
+    <section>
+      <h2>Behaviour</h2>
+      <label class="check">
+        <input type="checkbox" id="closeOnEnd" />
+        <span>Close the tab when its video ends</span>
+      </label>
+      <label class="check">
+        <input type="checkbox" id="autoplayNext" />
+        <span>Start playing the next tab automatically</span>
+      </label>
+      <label class="check">
+        <input type="checkbox" id="pauseOnLeave" />
+        <span>Pause a video when I switch away from it</span>
+      </label>
+      <label class="check">
+        <input type="checkbox" id="wrapAround" />
+        <span>Wrap back to the first tab at the end</span>
+      </label>
+
+      <label class="field">
+        <span>Wait before closing</span>
+        <span class="input"><input type="number" id="closeDelayMs" min="0" max="15000" step="100" /> ms</span>
+      </label>
+      <label class="field">
+        <span>Ignore videos shorter than</span>
+        <span class="input"><input type="number" id="minDurationSec" min="0" max="600" step="1" /> s</span>
+      </label>
+    </section>
+
+    <section>
+      <h2>Speed</h2>
+      <label class="field">
+        <span>Play everything at</span>
+        <span class="input">
+          <select id="defaultRate">
+            <option value="1">Normal</option>
+            <option value="1.25">1.25×</option>
+            <option value="1.5">1.5×</option>
+            <option value="1.75">1.75×</option>
+            <option value="2">2×</option>
+            <option value="2.5">2.5×</option>
+          </select>
+        </span>
+      </label>
+      <label class="check">
+        <input type="checkbox" id="skipSilence" />
+        <span>Speed up further while nobody is talking</span>
+      </label>
+      <label class="field">
+        <span>Multiply speed by</span>
+        <span class="input">
+          <select id="silenceMultiplier">
+            <option value="1.5">1.5×</option>
+            <option value="2">2×</option>
+            <option value="2.5">2.5×</option>
+            <option value="3">3×</option>
+          </select>
+        </span>
+      </label>
+      <label class="field">
+        <span>Sensitivity</span>
+        <span class="input">
+          <select id="silenceMarginDb">
+            <option value="20">Cautious</option>
+            <option value="14">Balanced</option>
+            <option value="9">Aggressive</option>
+          </select>
+        </span>
+      </label>
+      <label class="check">
+        <input type="checkbox" id="showSpeedBadge" />
+        <span>Show a speed badge on the video</span>
+      </label>
+      <p id="silence-note" class="note" hidden></p>
+    </section>
+
+    <section>
+      <div class="section-head">
+        <h2>Closed by Tab Runner</h2>
+        <button id="clear-history" class="link">Clear</button>
+      </div>
+      <ul id="history" class="history"></ul>
+      <p id="history-empty" class="empty">Nothing closed yet.</p>
+    </section>
+
+    <footer>
+      <p>Shortcuts: <kbd>Alt+Shift+R</kbd> run · <kbd>Alt+Shift+N</kbd> done · <kbd>Alt+Shift+M</kbd> skip</p>
+    </footer>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>
