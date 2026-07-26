@@ -12,20 +12,45 @@ const DEFAULTS = {
   minDurationSec: 15,
   pauseOnLeave: true,
   autoplayNext: true,
+  autoStartPaused: true,
   defaultRate: 1,
 };
 
 let settings = { ...DEFAULTS };
 
-chrome.storage.local.get(DEFAULTS).then((s) => {
-  settings = s;
-});
-chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== 'local') return;
-  for (const [key, { newValue }] of Object.entries(changes)) {
-    if (key in settings) settings[key] = newValue;
+/**
+ * Reloading or updating the extension orphans the content scripts already
+ * running in open tabs. Their chrome.* handles survive syntactically but throw
+ * "Extension context invalidated" on use - and throw *synchronously*, so a
+ * trailing .catch() on the returned promise never sees it.
+ *
+ * Every chrome.* call from this file goes through here, so an orphaned copy
+ * degrades quietly instead of spraying uncaught errors and silently stalling
+ * the queue. The service worker re-injects a live copy on startup.
+ */
+function safely(fn) {
+  try {
+    if (!chrome.runtime?.id) return null;
+    return fn();
+  } catch {
+    return null;
   }
-});
+}
+
+safely(() =>
+  chrome.storage.local.get(DEFAULTS).then((s) => {
+    settings = s;
+  })
+);
+
+safely(() =>
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local') return;
+    for (const [key, { newValue }] of Object.entries(changes)) {
+      if (key in settings) settings[key] = newValue;
+    }
+  })
+);
 
 /**
  * True while an ad is on screen. An ad's <video> fires `ended` exactly like the
@@ -85,16 +110,18 @@ document.addEventListener(
     // on SPA players that reuse one <video> across navigations.
     SilenceSkip.reset();
 
-    chrome.runtime
-      .sendMessage({
-        type: 'media-ended',
-        url: location.href,
-        title: document.title,
-        duration: media.duration,
-      })
-      .catch(() => {
-        /* service worker asleep or extension reloading */
-      });
+    safely(() =>
+      chrome.runtime
+        .sendMessage({
+          type: 'media-ended',
+          url: location.href,
+          title: document.title,
+          duration: media.duration,
+        })
+        .catch(() => {
+          /* service worker asleep */
+        })
+    );
   },
   true
 );
@@ -168,17 +195,19 @@ let resumeTimer = null;
  * sitting in the background for hours may have been discarded and is still
  * re-rendering when we arrive.
  *
- * Unconditional by design: landing on a tab starts its video whatever state it
- * was left in, whether it never started or was paused by hand. The runner exists
- * to keep playback moving, so it does not try to guess which pauses were
- * deliberate.
+ * With `autoStartPaused` on (the default) this is unconditional: landing on a
+ * tab starts its video whatever state it was left in. With it off, only videos
+ * that have never been started are touched, so a video paused part-way through
+ * stays paused.
  */
 function requestResume(attempt = 0) {
   clearTimeout(resumeTimer);
 
   const video = mainVideo();
   if (video) {
-    if (video.paused) playWithAutoplayFallback(video);
+    if (!video.paused) return;
+    const neverStarted = video.currentTime === 0;
+    if (settings.autoStartPaused || neverStarted) playWithAutoplayFallback(video);
     return;
   }
 
@@ -202,14 +231,28 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === 'silence-status') {
     sendResponse(SilenceSkip.status());
   }
+  if (message?.type === 'ping') {
+    sendResponse({ alive: true });
+  }
   if (message?.type === 'has-video') {
     // Only a video with actual media behind it counts. An empty <video> element
     // - YouTube's home page keeps one around for hover previews - is not
     // something worth stopping the queue on.
     const video = mainVideo();
-    sendResponse({
-      hasVideo: Boolean(video && (video.readyState > 0 || video.currentSrc)),
-    });
+    const hasVideo = Boolean(video && (video.readyState > 0 || video.currentSrc));
+
+    // This script runs in every frame, and Chrome uses whichever frame answers
+    // first. A "yes" is always right, so send it immediately. A "no" from the
+    // top frame is only right if no subframe has a video - courses often put the
+    // player in a cross-origin iframe - so hold it briefly and let any subframe
+    // win the race. Subframes without video stay silent entirely.
+    if (hasVideo) {
+      sendResponse({ hasVideo: true });
+      return false;
+    }
+    if (window.top !== window) return false;
+    setTimeout(() => sendResponse({ hasVideo: false }), 150);
+    return true;
   }
   return false;
 });

@@ -273,5 +273,42 @@ for (const event of [chrome.tabs.onCreated, chrome.tabs.onRemoved, chrome.tabs.o
   event.addListener(() => updateBadge());
 }
 
-chrome.runtime.onStartup.addListener(() => stopRun());
-chrome.runtime.onInstalled.addListener(() => stopRun());
+/**
+ * Reloading or updating the extension orphans the content scripts in tabs that
+ * were already open. They keep running, but every chrome.* call throws, so a
+ * finished video never reports back and the queue silently stops - with no
+ * symptom beyond an "Extension context invalidated" entry in the error log.
+ *
+ * Chrome does not re-inject into existing tabs by itself, so do it here. Any tab
+ * that answers a ping already has a live copy and is left alone.
+ */
+async function reinjectContentScripts() {
+  const scripts = chrome.runtime.getManifest().content_scripts ?? [];
+  for (const script of scripts) {
+    const tabs = await chrome.tabs.query({ url: script.matches }).catch(() => []);
+    for (const tab of tabs) {
+      // A discarded tab runs nothing and re-injects itself when it wakes.
+      if (tab.discarded || !tab.id) continue;
+      const alive = await chrome.tabs.sendMessage(tab.id, { type: 'ping' }).catch(() => null);
+      if (alive) continue;
+      await chrome.scripting
+        .executeScript({
+          target: { tabId: tab.id, allFrames: Boolean(script.all_frames) },
+          files: script.js,
+        })
+        .catch(() => {
+          /* restricted page, or the tab went away mid-flight */
+        });
+    }
+  }
+}
+
+chrome.runtime.onStartup.addListener(async () => {
+  await stopRun();
+  await reinjectContentScripts();
+});
+
+chrome.runtime.onInstalled.addListener(async () => {
+  await stopRun();
+  await reinjectContentScripts();
+});

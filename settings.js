@@ -25,6 +25,9 @@ export const DEFAULTS = {
   wrapAround: false,
   pauseOnLeave: true,
   autoplayNext: true,
+  // Whether autoplay also restarts a video that was paused part-way through, as
+  // opposed to only ones that never started.
+  autoStartPaused: true,
   historyLimit: 60,
 
   // Step over tabs with nothing to play instead of stalling on them. On by
@@ -54,6 +57,7 @@ export const DEFAULTS = {
 export const SETTING_CONTROLS = {
   closeOnEnd: 'checkbox',
   autoplayNext: 'checkbox',
+  autoStartPaused: 'checkbox',
   pauseOnLeave: 'checkbox',
   wrapAround: 'checkbox',
   skipTabsWithoutVideo: 'checkbox',

@@ -3,7 +3,7 @@
   "name": "Tab Runner",
   "version": "1.0.0",
   "description": "Play through a window of video tabs hands-free: when a video ends, close the tab and start the next one to the right.",
-  "permissions": ["tabs", "storage"],
+  "permissions": ["tabs", "storage", "scripting"],
   "host_permissions": ["http://*/*", "https://*/*"],
   "background": {
     "service_worker": "background.js",

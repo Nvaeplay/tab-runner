@@ -101,6 +101,8 @@ All in the popup:
 - **Close the tab when its video ends** — off turns the runner into a pure
   auto-advance: it moves on but leaves everything open.
 - **Start playing the next tab automatically** — the actual autoplay.
+- **Also start videos that were left paused** — off restricts autoplay to videos
+  that have never been started, so a video you paused part-way stays paused.
 - **Pause a video when I switch away from it** — stops two things playing at once.
 - **Wrap back to the first tab at the end** — makes the window a loop instead of
   a queue.
@@ -160,11 +162,18 @@ Things that are deliberate rather than incidental:
 - **Grabbing the wheel cancels the close.** During the grace period, if you
   switch tabs or the tab is no longer in front, the runner stands down rather
   than closing something you just moved to.
-- **Landing on a tab starts its video, unconditionally** — whether it never
-  started or you paused it by hand, and whether the runner advanced there or you
-  clicked the tab yourself. No attempt is made to guess which pauses were
-  deliberate; the runner exists to keep playback moving. Turn off *Start playing
-  the next tab automatically* if you'd rather it never touched playback.
+- **Landing on a tab starts its video by default** — whether it never started or
+  you paused it by hand. No attempt is made to guess which pauses were
+  deliberate; the runner exists to keep playback moving. Turn off *Also start
+  videos that were left paused* to restrict it to videos that never started, or
+  *Start playing the next tab automatically* to stop it touching playback at all.
+- **An extension reload replaces content scripts in open tabs.** Chrome doesn't
+  do this itself: the old copies keep running but every `chrome.*` call throws
+  `Extension context invalidated`, so a finished video never reports back and the
+  queue stops dead with no visible symptom. Tabs that answer a ping are left
+  alone; the rest are re-injected. Content scripts also route every `chrome.*`
+  call through a guard, because that error is thrown *synchronously* and a
+  trailing `.catch()` never sees it.
 - **`ended` is caught in the capture phase on `document`.** The event doesn't
   bubble, but a capturing listener still sees it. This survives SPA navigation
   and players that swap out their `<video>` element, which a direct listener on

@@ -342,6 +342,19 @@ var SilenceSkip = (() => {
   // -------------------------------------------------------------------------
 
   function tick() {
+    // An orphaned copy left behind by an extension reload must not keep an
+    // animation loop alive in the page forever.
+    try {
+      if (!chrome.runtime?.id) {
+        rafId = null;
+        release();
+        return;
+      }
+    } catch {
+      rafId = null;
+      return;
+    }
+
     rafId = requestAnimationFrame(tick);
     const now = performance.now();
 
@@ -400,6 +413,12 @@ var SilenceSkip = (() => {
   return {
     init(injected) {
       hooks = { ...hooks, ...injected };
+      // An orphaned copy throws on every chrome.* call; it has no work to do.
+      try {
+        if (!chrome.runtime?.id) return;
+      } catch {
+        return;
+      }
       chrome.storage.local.get(DEFAULTS).then((stored) => {
         settings = stored;
         start();
