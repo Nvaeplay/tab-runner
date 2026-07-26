@@ -160,10 +160,11 @@ Things that are deliberate rather than incidental:
 - **Grabbing the wheel cancels the close.** During the grace period, if you
   switch tabs or the tab is no longer in front, the runner stands down rather
   than closing something you just moved to.
-- **Arriving at a tab starts its video, whatever state it was left in** — that's
-  the point of the runner. But a plain tab switch doesn't: if you paused
-  something on purpose and later wander back to it by hand, it stays paused.
-  Only a deliberate advance forces playback.
+- **Landing on a tab starts its video, unconditionally** — whether it never
+  started or you paused it by hand, and whether the runner advanced there or you
+  clicked the tab yourself. No attempt is made to guess which pauses were
+  deliberate; the runner exists to keep playback moving. Turn off *Start playing
+  the next tab automatically* if you'd rather it never touched playback.
 - **`ended` is caught in the capture phase on `document`.** The event doesn't
   bubble, but a capturing listener still sees it. This survives SPA navigation
   and players that swap out their `<video>` element, which a direct listener on

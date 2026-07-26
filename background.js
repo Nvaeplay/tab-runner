@@ -157,10 +157,7 @@ async function advance(tab, { close, delay = 0 }) {
   }
 
   if (state.autoplayNext) {
-    // force: the runner chose to come here, so start the video whatever state
-    // it was left in. Plain tab switches do not force, so a video you paused on
-    // purpose stays paused when you wander back to it.
-    await tell(next.id, { type: 'resume', force: true });
+    await tell(next.id, { type: 'resume' });
   }
 
   await updateBadge();

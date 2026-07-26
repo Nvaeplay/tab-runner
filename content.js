@@ -130,7 +130,6 @@ document.addEventListener(
 // Playback control
 // ---------------------------------------------------------------------------
 
-let pausedByUs = false;
 
 /**
  * Chrome blocks unmuted programmatic playback unless the page has earned
@@ -165,31 +164,26 @@ async function playWithAutoplayFallback(video) {
 let resumeTimer = null;
 
 /**
- * Try to start playback, retrying while the page finishes loading. A tab that
- * has been sitting in the background for hours may have been discarded and is
- * still re-rendering when we arrive.
+ * Start playback, retrying while the page finishes loading. A tab that has been
+ * sitting in the background for hours may have been discarded and is still
+ * re-rendering when we arrive.
  *
- * `force` means the runner deliberately moved here, so start the video whatever
- * state it is in. Without it we only take over playback we are entitled to -
- * a video the user paused on purpose stays paused when they wander back to it.
+ * Unconditional by design: landing on a tab starts its video whatever state it
+ * was left in, whether it never started or was paused by hand. The runner exists
+ * to keep playback moving, so it does not try to guess which pauses were
+ * deliberate.
  */
-function requestResume(attempt = 0, force = false) {
+function requestResume(attempt = 0) {
   clearTimeout(resumeTimer);
 
   const video = mainVideo();
   if (video) {
-    if (!video.paused) return;
-    const neverStarted = video.currentTime === 0;
-    if (force || pausedByUs || neverStarted) {
-      pausedByUs = false;
-      playWithAutoplayFallback(video);
-      return;
-    }
+    if (video.paused) playWithAutoplayFallback(video);
     return;
   }
 
   if (attempt < 12) {
-    resumeTimer = setTimeout(() => requestResume(attempt + 1, force), 750);
+    resumeTimer = setTimeout(() => requestResume(attempt + 1), 750);
   }
 }
 
@@ -197,15 +191,12 @@ document.addEventListener('visibilitychange', () => {
   if (!document.hidden) return;
   if (!settings.pauseOnLeave) return;
   const video = mainVideo();
-  if (video && !video.paused) {
-    pausedByUs = true;
-    video.pause();
-  }
+  if (video && !video.paused) video.pause();
 });
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === 'resume') {
-    if (settings.autoplayNext) requestResume(0, Boolean(message.force));
+    if (settings.autoplayNext) requestResume();
     sendResponse({ ok: true });
   }
   if (message?.type === 'silence-status') {
