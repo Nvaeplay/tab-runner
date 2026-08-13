@@ -49,6 +49,34 @@ function run(segments, settings = BALANCED) {
   return { fast, times };
 }
 
+/**
+ * Same, but pushing full frames - level plus the spectral flatness of the
+ * speech band - which is what the shipped code measures. `swingDb` is the
+ * peak-to-peak syllable modulation to lay over the level.
+ *
+ * @param {Array<{db: number, ms: number, flatness: number, swingDb?: number}>} segments
+ */
+function runFrames(segments, settings = BALANCED) {
+  const decider = createDecider(() => settings);
+  const fast = [];
+  const times = [];
+  let now = 0;
+  for (const { db, ms, flatness, swingDb = 0 } of segments) {
+    for (let elapsed = 0; elapsed < ms; elapsed += FRAME_MS) {
+      // Syllables land at roughly 4 Hz, on top of the jitter any real signal has.
+      const syllable = (Math.sin((now / 1000) * 2 * Math.PI * 4) * swingDb) / 2;
+      const level = db + syllable + (Math.random() - 0.5) * 2;
+      fast.push(decider.push({ level, flatness }, now));
+      times.push(now);
+      now += FRAME_MS;
+    }
+  }
+  return { fast, times };
+}
+
+const SPEECH = { flatness: 0.2, swingDb: 14 };
+const ROOM = { flatness: 0.8 };
+
 /** Milliseconds spent at fast speed within a time window. */
 function fastMsBetween({ fast, times }, from, to) {
   let ms = 0;
@@ -194,6 +222,70 @@ Deno.test('at the shipped default, real dead air still gets sped up', () => {
     during > expected - 400,
     `expected roughly ${expected}ms fast in an 8s gap, got ${during}`
   );
+});
+
+// ---------------------------------------------------------------------------
+// Speech vs ambience
+//
+// Level alone cannot tell "quiet" from "nobody is talking". These cover the
+// second half of the decision: whether the sound above the threshold is shaped
+// like a voice or like a room.
+// ---------------------------------------------------------------------------
+
+Deno.test('a loud room with nobody talking in it gets skipped', () => {
+  // Ambience only 5 dB under the speech level - nowhere near the 14 dB margin,
+  // so on level alone this stretch would play out in full at 1x.
+  const trace = runFrames([
+    { db: -25, ms: 6000, ...SPEECH },
+    { db: -30, ms: 6000, ...ROOM },
+    { db: -25, ms: 2000, ...SPEECH },
+  ]);
+  const duringRoom = fastMsBetween(trace, 6000, 12000);
+  assert(duringRoom > 3000, `expected >3000ms fast over the room tone, got ${duringRoom}`);
+});
+
+Deno.test('the same stretch is NOT skipped on level alone', () => {
+  // The same trace pushed as bare levels, which is what the old detector saw.
+  // This is the bug the flatness and modulation tests exist to fix; if it ever
+  // starts passing, the fixture no longer reproduces it.
+  const trace = run([
+    { db: -25, ms: 6000 },
+    { db: -30, ms: 6000 },
+    { db: -25, ms: 2000 },
+  ]);
+  assertEquals(fastMsBetween(trace, 6000, 12000), 0);
+});
+
+Deno.test('speech is never demoted to ambience', () => {
+  const trace = runFrames([{ db: -25, ms: 12000, ...SPEECH }]);
+  assertEquals(fastMsBetween(trace, 0, 12000), 0);
+});
+
+Deno.test('a flat, level voice needs both tests to fail before it is demoted', () => {
+  // Monotone delivery - almost no syllable swing - but still peaky in the
+  // spectrum. One failing test is not enough.
+  const monotone = runFrames([{ db: -25, ms: 12000, flatness: 0.2, swingDb: 0 }]);
+  assertEquals(fastMsBetween(monotone, 0, 12000), 0, 'unmodulated but peaky is still a voice');
+
+  // And the other way round: broadband, but moving like syllables.
+  const noisy = runFrames([{ db: -25, ms: 12000, flatness: 0.8, swingDb: 14 }]);
+  assertEquals(fastMsBetween(noisy, 0, 12000), 0, 'modulated but flat is still a voice');
+});
+
+Deno.test('standDown makes the next gap earn the hold from scratch', () => {
+  // What a rebuffer does: the picture stops, the analyser reads silence, and
+  // without this the video would come back already at speed.
+  const decider = createDecider(() => BALANCED);
+  let now = 0;
+  for (let i = 0; i < 600; i++, now += FRAME_MS) decider.push(-25, now);
+
+  let fast = false;
+  for (let i = 0; i < 30; i++, now += FRAME_MS) fast = decider.push(-70, now);
+  assert(fast, 'a 500ms gap should be past the 350ms hold');
+
+  decider.standDown();
+  assertEquals(decider.push(-70, now), false);
+  assert(decider.threshold > -Infinity, 'standDown must not forget the video loudness');
 });
 
 Deno.test('reset clears learned loudness so a new video starts fresh', () => {

@@ -51,6 +51,25 @@ won't re-force it when you seek. Pitch is preserved, so 1.75× doesn't chipmunk.
 **Speed up further while nobody is talking** — multiplies whatever rate is in
 effect during quiet stretches, and drops back the instant sound returns.
 
+It never engages on a **live stream**, and there is no setting for that. A
+recording is already on its way down the wire, so spending buffer faster than
+real time costs nothing. A live stream only contains what has already been
+broadcast: it produces one second of media per second, and any rate above 1×
+borrows against the live edge until there is nothing left to play. The player
+stalls, buffers, and hands back a few seconds — which arrive as digital silence,
+which reads as "nobody is talking", which speeds it up again. A quiet moment in a
+live stream became permanent rebuffering. Nothing about a live stream makes
+speeding it up work, so there is nothing for a user to decide.
+
+Streams with no known end give themselves away with an infinite duration.
+YouTube's are seekable inside a DVR window and report *that* length, which looks
+exactly like a recording, so the player's own `ytp-live` marker is checked too —
+and as a last resort, a duration that keeps creeping forward.
+
+The same reasoning applies below the live line: speeding up also needs a few
+seconds of buffer ahead of the playhead, and hands the rate back if that runs
+down. A stalled video outputs nothing, and nothing measures as silence.
+
 **After this much quiet** (default 3 s) — how long silence must last before the
 speed-up kicks in. This is a feel control more than a savings one: at a few
 hundred milliseconds the rate changes on every breath between sentences, which
@@ -104,6 +123,8 @@ All in the popup:
 - **Also start videos that were left paused** — off restricts autoplay to videos
   that have never been started, so a video you paused part-way stays paused.
 - **Pause a video when I switch away from it** — stops two things playing at once.
+  Also stops anything *starting* in a tab you've left, including the runner's own
+  arrival retries. Works whether or not the runner is armed.
 - **Wrap back to the first tab at the end** — makes the window a loop instead of
   a queue.
 - **Skip past tabs with no video** — steps over tabs with nothing to play instead
@@ -125,15 +146,27 @@ since it only changes where the runner lands.
 A tab is only skipped when it can be **proven** to have no video, because
 skipping something watchable silently drops it from the queue. So:
 
-- Pages no content script can run in — `chrome://`, `about:blank`, the Web Store,
-  the PDF viewer — genuinely cannot play anything, and are skipped.
+- Pages no content script can run in — `chrome://`, `about:blank`, the new tab
+  page, the Web Store, the PDF viewer — genuinely cannot play anything, and are
+  skipped. This is settled from the URL alone, so it holds even for a tab Chrome
+  has put to sleep.
 - Ordinary pages are asked directly whether they hold a video with real media
   behind it. An empty `<video>` element (YouTube's home page keeps one for hover
   previews) doesn't count.
-- **Discarded or still-loading tabs are never skipped.** No content script is
-  running to ask, and the tab may well hold a video once it wakes up. In a large
-  pile these are common, so guessing would drop half the queue.
+- **Discarded or still-loading tabs get landed on, then checked again.** No
+  content script is running to ask, so the runner has to assume they might have
+  something. It moves there, waits for the tab to wake up, and then asks
+  repeatedly for a few seconds — a player that is still booting reports no media
+  for a while, and one negative answer is not enough to drop a tab from the queue.
+  Only a tab that stays empty the whole time is moved on from.
 - A page that should be reachable but isn't gets stopped at, not skipped.
+
+That last point matters more than it sounds. In a window you filled by spamming
+new tabs, Chrome has discarded most of the background ones, so the leftover new
+tab pages and bare YouTube home pages this setting exists to step over were
+exactly the ones the "assume it might" rule protected — which made the setting
+look like it did nothing. Checking again on arrival is what fixes it. One chain
+of arrival checks moves on at most 10 times.
 
 If everything ahead is videoless the runner stops and shows ✓ rather than
 depositing you on a blank tab. One advance looks ahead at most 25 tabs.
@@ -174,6 +207,37 @@ Things that are deliberate rather than incidental:
   alone; the rest are re-injected. Content scripts also route every `chrome.*`
   call through a guard, because that error is thrown *synchronously* and a
   trailing `.catch()` never sees it.
+- **Content scripts are wrapped so they can be injected twice.** The replacement
+  copy lands in the *same* isolated world as the orphan it replaces, so a
+  top-level `const` would throw `Identifier … has already been declared` and abort
+  the whole injection — leaving the tab with nothing but the dead copy, which
+  looks exactly like several unrelated features breaking at once. Everything lives
+  inside an IIFE, and a live copy is detected and left alone rather than stacked
+  on top of.
+- **Nothing starts playing in a background tab** while *Pause a video when I
+  switch away from it* is on. A single `visibilitychange` isn't enough for that: a
+  player can start on its own well after you left — YouTube's "up next", a lazily
+  initialised player, a discarded tab finishing its reload, or the runner's own
+  arrival retries, which keep looking for a video for ~9 seconds. `play` is
+  watched in the capture phase instead, which fires before any audio is produced.
+  There is a short grace period after the runner asks a tab to resume: activating
+  a tab and telling it to play travel different IPC pipes, so the message can
+  arrive while the renderer still reports the tab as hidden, and without the grace
+  this guard stopped the video the runner had just started.
+- **The tab being left is told to stop from outside the page.** Leaving the pause
+  to the page's own `visibilitychange` puts it at the mercy of the page: content
+  scripts run at `document_idle`, so ours is always the *last* listener added to
+  that document, and a page listener that runs first and calls
+  `stopImmediatePropagation()` takes every later one down with it. The service
+  worker now remembers which tab was in front of each window and sends the one
+  you left an explicit stop, which does not travel through the page at all. The
+  content script's own visibility watch stays as the second route, moved to a
+  **capturing listener on `window`** so it runs ahead of the entire document
+  phase, and the stop is re-applied over the next second and a half so a player
+  that undoes an outside pause doesn't win the last word. The last-active tab per
+  window lives in `chrome.storage.session`, not a variable: the worker is torn
+  down seconds after it goes idle, and a variable would be empty on exactly the
+  event that needs it.
 - **`ended` is caught in the capture phase on `document`.** The event doesn't
   bubble, but a capturing listener still sees it. This survives SPA navigation
   and players that swap out their `<video>` element, which a direct listener on
@@ -187,26 +251,56 @@ Things that are deliberate rather than incidental:
   running — which Chrome does allow. On sites you watch often, the first attempt
   usually just works.
 
-## How silence detection works, and where it doesn't
+## How speech detection works, and where it doesn't
 
-It measures energy in the 300–3400 Hz speech band via a Web Audio `AnalyserNode`,
-and compares it against a threshold derived from **the video's own recent
-loudness** — the 90th percentile of the last ~10 seconds, minus a margin. That
-adaptive baseline is why a quietly-recorded lecture and a loud one both work
-without touching the sensitivity dial.
+Everything is measured off one Web Audio `AnalyserNode` on the 300–3400 Hz speech
+band, and a frame has to fail three tests before it counts as "nobody is talking".
 
-It is **not** a speech classifier. It cannot tell speech from other sound, and
-the tests pin down both directions of that:
+**Is it loud enough?** The level is compared against a threshold derived from
+**the video's own recent loudness** — the 90th percentile of the last ~10 seconds,
+minus a margin. That adaptive baseline is why a quietly-recorded lecture and a
+loud one both work without touching the sensitivity dial.
+
+**Is it moving like speech?** Level alone cannot tell a quiet room from a loud
+one. A kitchen, a car, an air conditioner, road noise, a crowd — any of these can
+sit close enough to the speaking level that nothing ever falls under the
+threshold, and a stretch with nobody talking in it plays out in full at 1×. But
+speech is *modulated*: syllables push the band up and down by 10–25 dB several
+times a second, where ambience holds a near-constant level. The recent
+peak-to-trough range over the last second separates the two.
+
+**Is it shaped like speech?** Voiced sound is a pitch plus its harmonics under a
+couple of formants — a few strong peaks. Broadband noise spreads evenly. The
+spectral flatness of the band (geometric mean over arithmetic mean, ~0 for peaks
+and 1 for white noise) says which one this is.
+
+Neither shape test is conclusive alone — a held note is unmodulated, a hiss is
+brief — so a frame above the threshold is only demoted to ambience when it fails
+**both**. The tests pin that down in all four directions.
+
+It is still **not** a speech classifier, and music is where that shows:
 
 - A music bed 15 dB under the narration reads as silence and gets sped through.
-- Music only 6 dB under the narration reads as sound, so a musical interlude with
-  no talking is *not* skipped.
+- Music only 6 dB under the narration is modulated *and* peaky, so a musical
+  interlude with no talking is *not* skipped.
 
-If that turns out to be the thing that bothers you, the upgrade is a real voice
-activity detector — Silero VAD via ONNX Runtime Web in an `AudioWorklet`. It
-genuinely distinguishes speech from music. It also costs a ~2 MB model per tab
-and runs into page CSP restrictions on some sites, which is why it isn't the
-default.
+### Why not a transcript API or a real VAD
+
+Three options were weighed against the local analysis above before it was built.
+
+| Approach | Verdict |
+| --- | --- |
+| **Local DSP** — level + modulation + flatness | **Shipped.** ~40 lines on an analyser that was already running. No model, no download, no permission, no per-tab cost worth measuring. Beats level alone on exactly the failure that prompted it: loud ambience. Cannot tell speech from music. |
+| **Web Speech API** — `SpeechRecognition.start(audioTrack)`, [Chrome 133+](https://chromestatus.com/feature/5178378197139456), on-device via [`processLocally`](https://developer.mozilla.org/en-US/docs/Web/API/SpeechRecognition/processLocally) | **No.** It can genuinely take tab audio now, and on-device keeps it private. But recognition results land hundreds of milliseconds to seconds behind the audio, and the whole feature turns on reacting to speech *within one frame*. A transcript tells you what was said after it was said. It also needs `captureStream()`, which fails on DRM-protected media, and a language pack that may not be installed. |
+| **Silero VAD** via ONNX Runtime Web in an `AudioWorklet` | **Not now.** A real speech/music/noise classifier, and the only option that fixes the music case. Costs a ~2 MB model plus the ORT wasm runtime in every tab, needs `wasm-unsafe-eval`, and runs into page CSP on some sites. Worth revisiting if music turns out to be the thing that bothers you; ambience was. |
+
+Captions are the other tempting "transcript" answer — cue gaps are exact speech
+boundaries and cost nothing to read. `video.textTracks` is the honest version of
+that and is worth using where a player exposes it, but YouTube renders its own
+captions in its own overlay and exposes nothing there, so getting them means
+scraping the timed-text endpoint out of the player response. That is fragile,
+site-specific, and it is a network fetch for something a local measurement
+already answers.
 
 ### Why it refuses to run on some pages
 
@@ -267,6 +361,18 @@ music failure modes.
 control has a default behind it, every dropdown has an option matching that
 default, control kinds match the markup and the default's type, and the popup
 never goes back to sourcing setting values from the worker.
+
+It also guards three things that aren't schema, but broke the same quiet way —
+working code, no error, a feature that just doesn't happen:
+
+- The content scripts' own `DEFAULTS` must match `settings.js`. They can't import
+  it (MV3 content scripts are classic scripts), and their copy is what a fresh
+  profile runs on until the popup writes something. `silence-skip.js` once shipped
+  a 350 ms silence threshold against a 3 s default here.
+- `content.js` must declare nothing at top level, or re-injection dies on a
+  redeclaration.
+- `tabHasVideo` must rule tabs out by URL *before* looking at load state, or every
+  discarded tab becomes a stop.
 
 ## Development note
 

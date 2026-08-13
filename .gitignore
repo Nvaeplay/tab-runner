@@ -8,6 +8,11 @@ dist/
 node_modules/
 deno.lock
 
+# Never: store credentials, signing keys, API tokens
+.env
+.env.*
+!.env.example
+
 # Editors
 .vscode/
 .idea/

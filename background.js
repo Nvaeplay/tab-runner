@@ -15,6 +15,15 @@ const ADVANCE_COOLDOWN_MS = 4000;
 // window full of videoless tabs cannot turn into a long scan.
 const MAX_SKIPS = 25;
 
+// Ceiling on how many times an arrival check will move on again after finding
+// nothing to play, so a window of sleeping videoless tabs cannot walk forever.
+const MAX_ARRIVAL_HOPS = 10;
+
+// A player that is still booting reports no media for a while, so an arrival
+// check asks repeatedly and only gives up on a tab that stays empty throughout.
+const ARRIVAL_TRIES = 6;
+const ARRIVAL_GAP_MS = 700;
+
 // Tab id -> timestamp of the last advance we started for it. Guards against
 // duplicate `ended` events (multiple frames, YouTube re-firing on seek).
 const recentAdvances = new Map();
@@ -62,14 +71,20 @@ async function tell(tabId, message) {
  * "might have video" and gets stopped at.
  */
 async function tabHasVideo(tab) {
-  // Discarded or still loading: no content script is running to ask, and the
-  // tab may well hold a video once it wakes up. In a large pile these are
-  // common, so guessing here would skip half the queue.
-  if (tab.discarded || tab.status === 'unloaded' || tab.status === 'loading') return true;
+  // Pages no content script can run in - chrome://, about:blank, the new tab
+  // page, the Web Store, the PDF viewer. These genuinely cannot be playing
+  // anything, and that stays true whether the tab is loaded, loading or
+  // discarded, so it is settled first. `pendingUrl` covers a tab that is on its
+  // way to a real page but has no `url` yet.
+  if (!/^https?:/i.test(tab.url || tab.pendingUrl || '')) return false;
 
-  // Pages no content script can run in - chrome://, about:blank, the Web Store,
-  // the PDF viewer. These genuinely cannot be playing anything.
-  if (!/^https?:/i.test(tab.url || '')) return false;
+  // Making sound settles it without asking anyone.
+  if (tab.audible) return true;
+
+  // Discarded or still loading: no content script is running to ask, and the tab
+  // may well hold a video once it wakes up. Assume it might, land on it, and let
+  // the arrival check settle it for real once it is awake.
+  if (tab.discarded || tab.status === 'unloaded' || tab.status === 'loading') return true;
 
   const reply = await chrome.tabs.sendMessage(tab.id, { type: 'has-video' }).catch(() => null);
   // Unreachable despite being an ordinary page: assume it might, and stop.
@@ -124,8 +139,9 @@ async function recordClosed(tab, state) {
  * @param {object}          opts
  * @param {boolean}         opts.close  close `tab` once we have moved off it
  * @param {number}          opts.delay  ms to wait before acting
+ * @param {number}          opts.hops   arrival checks already chained (internal)
  */
-async function advance(tab, { close, delay = 0 }) {
+async function advance(tab, { close, delay = 0, hops = 0 }) {
   const state = await getState();
 
   if (delay > 0) {
@@ -161,6 +177,83 @@ async function advance(tab, { close, delay = 0 }) {
   }
 
   await updateBadge();
+
+  // Only while the runner is actually driving this window. A manual advance on an
+  // idle window does exactly one hop, the way it always did.
+  if (
+    state.enabled &&
+    state.windowId === next.windowId &&
+    state.skipTabsWithoutVideo &&
+    hops < MAX_ARRIVAL_HOPS
+  ) {
+    await confirmArrival(next, hops);
+  }
+}
+
+/**
+ * Wait for a tab to finish waking up, then hand back its current state.
+ *
+ * Returns null if the tab went away. Gives up after `timeoutMs` and returns
+ * whatever the tab looks like by then, so a page that never reaches `complete`
+ * gets asked rather than holding up the queue.
+ */
+async function waitForLoad(tabId, timeoutMs = 8000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab) return null;
+    if (!tab.discarded && tab.status === 'complete') {
+      // Content scripts run at document_idle, a beat after `complete`.
+      await sleep(400);
+      return chrome.tabs.get(tabId).catch(() => null);
+    }
+    await sleep(300);
+  }
+  return chrome.tabs.get(tabId).catch(() => null);
+}
+
+/**
+ * Ask a tab we had to guess about whether it actually holds a video, now that it
+ * is awake - and move on if it does not.
+ *
+ * A discarded or still-loading tab cannot be asked, so `pickNextStop` has to
+ * assume it might have something and land on it. That assumption is why "skip
+ * past tabs with no video" looked like it did nothing: in a window you filled by
+ * spamming new tabs, Chrome has discarded most of the background ones, so the
+ * leftover new tab pages and bare YouTube home pages the setting exists to step
+ * over were exactly the ones the assumption protected.
+ *
+ * Nothing is closed here - skipping never closes anything. Bounded by
+ * MAX_ARRIVAL_HOPS, and abandoned the moment this tab is no longer the one in
+ * front, which means the user is driving.
+ */
+async function confirmArrival(tab, hops) {
+  const wasAsleep = tab.discarded || tab.status === 'unloaded' || tab.status === 'loading';
+  if (!wasAsleep) return;
+
+  let awake = await waitForLoad(tab.id);
+  if (!awake || !awake.active) return;
+
+  // `complete` is not the same as "the player has media". YouTube's <video>
+  // element exists long before it has a source, so a single negative answer here
+  // would drop a perfectly good video tab out of the queue - and leave the runner
+  // parked on nothing, with no video to end and so nothing left to close. Keep
+  // asking, and only move on if it stays empty the whole time.
+  for (let attempt = 0; attempt < ARRIVAL_TRIES; attempt++) {
+    if (await tabHasVideo(awake)) return;
+    if (attempt < ARRIVAL_TRIES - 1) await sleep(ARRIVAL_GAP_MS);
+    awake = await chrome.tabs.get(tab.id).catch(() => null);
+    // Gone, or the user took the wheel while we were asking.
+    if (!awake || !awake.active) return;
+  }
+
+  // Re-read: the popup may have changed things while the tab was waking.
+  const state = await getState();
+  if (!state.skipTabsWithoutVideo) return;
+  if (!state.enabled || state.windowId !== awake.windowId) return;
+
+  markAdvance(awake.id);
+  await advance(awake, { close: false, delay: 0, hops: hops + 1 });
 }
 
 /** A video finished playing in `tab`. */
@@ -255,16 +348,84 @@ chrome.commands.onCommand.addListener(async (command) => {
   await advance(active, { close: command === 'advance-close', delay: 0 });
 });
 
+/**
+ * Which tab was last in front of each window, so the tab being *left* can be
+ * told to stop.
+ *
+ * Kept in chrome.storage.session rather than a module-level Map. The service
+ * worker is torn down a few seconds after it goes idle, and a Map would come
+ * back empty on exactly the event that needs it - the first tab switch after
+ * every idle period, which is most of them.
+ */
+const LAST_ACTIVE_KEY = 'lastActiveByWindow';
+
+async function readLastActive() {
+  const stored = await chrome.storage.session.get({ [LAST_ACTIVE_KEY]: {} }).catch(() => null);
+  return stored?.[LAST_ACTIVE_KEY] ?? {};
+}
+
+/** Record the tab now in front of `windowId`, and hand back the one it replaced. */
+async function rememberActive(windowId, tabId) {
+  const map = await readLastActive();
+  const previous = map[windowId];
+  map[windowId] = tabId;
+  await chrome.storage.session.set({ [LAST_ACTIVE_KEY]: map }).catch(() => {});
+  return previous === undefined ? null : previous;
+}
+
+/**
+ * Fill in the tab in front of every window we have not seen switch yet, so the
+ * first switch after the worker wakes knows what it is leaving.
+ *
+ * Windows already recorded are left alone: an activation that landed while this
+ * was in flight holds the newer truth.
+ */
+async function seedLastActive() {
+  const map = await readLastActive();
+  const active = await chrome.tabs.query({ active: true }).catch(() => []);
+  let added = false;
+  for (const tab of active) {
+    if (map[tab.windowId] === undefined) {
+      map[tab.windowId] = tab.id;
+      added = true;
+    }
+  }
+  if (added) await chrome.storage.session.set({ [LAST_ACTIVE_KEY]: map }).catch(() => {});
+}
+
 // Switching tabs by hand should pause whatever you just walked away from and
 // pick up whatever you walked into.
+//
+// The pause used to be left entirely to the content script noticing its own
+// `visibilitychange`. That put it inside the page's reach: the event is
+// dispatched on the page's own document, and a content script - running at
+// document_idle - is always the last listener added to it, so a page listener
+// that runs first and stops propagation takes ours with it. Telling the tab from
+// out here does not go through the page at all. The content script still watches
+// its own visibility, hardened; this is the independent second route, and it is
+// the one that holds when the page fights the first.
 chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
+  const previous = await rememberActive(windowId, tabId);
   const state = await getState();
+
+  // Not gated on the runner. "Pause a video when I switch away from it" is about
+  // the browser, not about the queue, and it has always applied whether or not
+  // Tab Runner is running on this window.
+  if (state.pauseOnLeave && previous !== null && previous !== tabId) {
+    await tell(previous, { type: 'pause' });
+  }
+
   if (!state.enabled || state.windowId !== windowId) return;
   if (state.autoplayNext) await tell(tabId, { type: 'resume' });
 });
 
 // The runner is scoped to one window; if that window goes away, stand down.
 chrome.windows.onRemoved.addListener(async (windowId) => {
+  const map = await readLastActive();
+  if (windowId in map) {
+    delete map[windowId];
+    await chrome.storage.session.set({ [LAST_ACTIVE_KEY]: map }).catch(() => {});
+  }
   const state = await getState();
   if (state.windowId === windowId) await stopRun();
 });
@@ -312,3 +473,8 @@ chrome.runtime.onInstalled.addListener(async () => {
   await stopRun();
   await reinjectContentScripts();
 });
+
+// Runs on every wake, not just on install. Deliberately not awaited: listeners
+// have to be registered synchronously or the worker misses the event that woke
+// it, and nothing above depends on the seed having finished.
+seedLastActive();

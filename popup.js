@@ -128,6 +128,9 @@ async function renderSilenceNote(state) {
   } else if (status.disabledReason) {
     note.textContent =
       SILENCE_NOTES[status.disabledReason] ?? `Off on this page (${status.disabledReason}).`;
+  } else if (status.live) {
+    note.textContent =
+      'Off for this video: a live stream has no buffer to spend, so speeding it up only makes it rebuffer.';
   } else if (status.active) {
     note.textContent = status.engaged ? 'Speeding up now.' : 'Listening — normal speed.';
   } else {

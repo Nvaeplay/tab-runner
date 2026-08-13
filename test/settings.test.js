@@ -87,6 +87,71 @@ Deno.test('dropdown options all parse as numbers', () => {
   }
 });
 
+/**
+ * The DEFAULTS literal out of a content script. MV3 content scripts are classic
+ * scripts and cannot import settings.js, so they carry their own copy - which is
+ * what a fresh profile runs on, since storage holds nothing until the popup
+ * writes something.
+ */
+function contentDefaults(file) {
+  const src = Deno.readTextFileSync(new URL(`../${file}`, import.meta.url));
+  const literal = src.match(/const DEFAULTS = (\{[^}]*\})/);
+  assert(literal, `no DEFAULTS object literal found in ${file}`);
+  return new Function(`return ${literal[1]}`)();
+}
+
+Deno.test('content script defaults match settings.js', () => {
+  // silence-skip.js once shipped silenceHoldMs: 350 against a 3000 default here,
+  // so a fresh install got the sub-second speed-ups the 3s default exists to
+  // avoid until the user happened to touch that dropdown.
+  for (const file of ['content.js', 'silence-skip.js']) {
+    for (const [key, value] of Object.entries(contentDefaults(file))) {
+      assert(
+        Object.hasOwn(DEFAULTS, key),
+        `${file} defaults "${key}", which settings.js does not define`
+      );
+      assert(
+        DEFAULTS[key] === value,
+        `${file} defaults ${key} to ${value} but settings.js says ${DEFAULTS[key]} ` +
+          `- a fresh profile would run on the wrong value`
+      );
+    }
+  }
+});
+
+Deno.test('content.js declares nothing at top level', () => {
+  // The service worker re-injects content scripts after a reload, into the same
+  // isolated world as the copy being replaced. A top-level `const` would throw
+  // "already been declared" and abort the whole injection, leaving the tab with
+  // only the dead copy: no video reports, no autoplay, no has-video answer.
+  const src = Deno.readTextFileSync(new URL('../content.js', import.meta.url));
+  const declaration = src.match(/^(?:const|let|class|function)\s+\S+/m);
+  assert(
+    !declaration,
+    `content.js declares "${declaration?.[0]}" at top level - re-injection would ` +
+      `throw a redeclaration error and abort. Keep declarations inside the IIFE.`
+  );
+});
+
+Deno.test('videoless tabs are ruled out by URL before load state', () => {
+  // A discarded chrome://newtab is still provably videoless. Testing load state
+  // first made every discarded tab a stop, which is most of a hoarded window.
+  const src = Deno.readTextFileSync(new URL('../background.js', import.meta.url));
+  const body = src.match(/async function tabHasVideo\(tab\) \{([\s\S]*?)\n\}/);
+  assert(body, 'tabHasVideo not found in background.js');
+  // Comments stripped: both terms are discussed in the prose above the code.
+  const code = body[1].replace(/\/\/.*$/gm, '');
+  const url = code.indexOf('tab.pendingUrl');
+  const state = code.indexOf('tab.discarded');
+  assert(url !== -1, 'tabHasVideo no longer reads tab.pendingUrl');
+  assert(state !== -1, 'tabHasVideo no longer reads tab.discarded');
+  assert(
+    url < state,
+    'tabHasVideo checks load state before the URL again - discarded videoless ' +
+      'tabs would all become stops'
+  );
+});
+
 Deno.test('the popup does not ask the worker for setting values', () => {
   // The original bug: the popup rendered from state the service worker sent
   // back, and the worker only reloads with the extension.

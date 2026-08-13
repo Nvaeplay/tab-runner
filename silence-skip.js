@@ -5,15 +5,35 @@
  * instant sound returns.
  *
  * What this actually measures: energy in the 300-3400 Hz speech band, compared
- * against a threshold derived from the video's own recent loudness. It is not a
- * speech classifier - music or room tone will read as "sound" and hold it at
- * normal speed. See README for where that shows.
+ * against a threshold derived from the video's own recent loudness, plus two
+ * cheap shape tests that tell a talking human from a loud room. It is still not
+ * a speech classifier - music will read as "sound" and hold it at normal speed.
+ * See README for where that shows.
  *
- * Loaded before content.js, which hands it a video getter and an ad check via
- * init(). It owns nothing else: no tab logic lives here.
+ * Loaded before content.js, which hands it a video getter, an ad check and a
+ * live-stream check via init(). It owns nothing else: no tab logic lives here.
  */
 
 var SilenceSkip = (() => {
+  /** True while the extension context that created this instance is still live. */
+  const contextAlive = () => {
+    try {
+      return Boolean(chrome.runtime?.id);
+    } catch {
+      return false;
+    }
+  };
+
+  /**
+   * Like content.js, this file has to survive being injected twice into one page
+   * after an extension reload. A live instance is handed straight back rather
+   * than rebuilt: its animation loop would otherwise run twice, and its cached
+   * MediaElementSource nodes cannot be created a second time for the same
+   * element. A dead instance left behind by the reload is replaced.
+   */
+  if (globalThis.__tabRunnerSilenceAlive?.()) return globalThis.__tabRunnerSilence;
+  globalThis.__tabRunnerSilenceAlive = contextAlive;
+
   const SPEECH_BAND_HZ = [300, 3400];
   const FFT_SIZE = 1024;
   const HISTORY_FRAMES = 600; // ~10s at 60fps
@@ -28,20 +48,56 @@ var SilenceSkip = (() => {
   // we conclude the audio graph is giving us nothing and stand down.
   const DEAD_SIGNAL_FRAMES = 480; // ~8s
 
+  // Seconds of already-downloaded media that must sit ahead of the playhead
+  // before we are willing to consume it faster than it arrives, and the point at
+  // which we hand the rate back.
+  //
+  // Playing at 2x spends two seconds of buffer per second of wall clock. On a
+  // recording that is free - the rest of the file is already on its way - but on
+  // anything delivered in real time it is borrowed, and running the buffer flat
+  // stalls the player. See the live-stream note on isLive().
+  const ENGAGE_MIN_BUFFER_SEC = 3;
+  const RELEASE_MIN_BUFFER_SEC = 1.5;
+
+  // Consecutive small forward steps in duration before a stream is called live.
+  // A recording settles its duration in one or two jumps as the manifest loads;
+  // a live window creeps forward for as long as the broadcast runs.
+  const LIVE_GROWTH_EVENTS = 3;
+
+  // Must match settings.js. These are what a fresh profile runs on, since
+  // storage holds nothing until the popup writes something.
+  // test/settings.test.js fails if they drift apart.
   const DEFAULTS = {
     skipSilence: false,
     silenceMultiplier: 2,
     silenceMarginDb: 14,
-    silenceHoldMs: 350,
+    silenceHoldMs: 3000,
     showSpeedBadge: true,
   };
 
   let settings = { ...DEFAULTS };
-  let hooks = { getVideo: () => null, isAd: () => false };
+  let hooks = { getVideo: () => null, isAd: () => false, isLive: () => false };
+
+  // Frames of level history the "is this modulated like speech" test looks at.
+  const MOD_WINDOW_FRAMES = 60; // ~1s at 60fps
+
+  // A talking human swings the speech band by 10-25 dB inside a second, syllable
+  // by syllable. A fan, an engine, rain, road noise or room tone sits still.
+  const AMBIENT_MOD_MAX_DB = 6;
+
+  // Spectral flatness: 1 is white noise, near 0 is a handful of strong peaks.
+  // Voiced speech is all formants and harmonics and lands well under this;
+  // broadband ambience lands over it.
+  const AMBIENT_FLATNESS_MIN = 0.45;
+
+  /** Value at `p` through an already-sorted array. */
+  function at(sorted, p) {
+    return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))];
+  }
 
   /**
    * The whole decision, isolated from audio plumbing: given a stream of
-   * speech-band levels in dB, say whether playback should be fast right now.
+   * speech-band measurements, say whether playback should be fast right now.
    *
    * Pure and side-effect free so it can be tested against synthetic audio
    * without a browser. See test/decider.test.js.
@@ -69,12 +125,28 @@ var SilenceSkip = (() => {
       },
 
       /**
-       * @param {number} level dB in the speech band; -Infinity for digital silence
+       * Abandon the current run of quiet without forgetting how loud this video
+       * is. Used when the picture stops being measurable - a rebuffer, a stall -
+       * so the gap that follows has to earn the full hold again instead of
+       * arriving already counted as silence.
+       */
+      standDown() {
+        quietSince = 0;
+        fast = false;
+      },
+
+      /**
+       * @param {number|{level: number, flatness: number}} frame
+       *   Speech-band level in dB (-Infinity for digital silence), optionally
+       *   with the band's spectral flatness. A bare number skips the
+       *   speech-vs-ambience test and decides on level alone.
        * @param {number} now   monotonic ms
        * @returns {boolean}    true while playback should run fast
        */
-      push(level, now) {
+      push(frame, now) {
         const { silenceMarginDb, silenceHoldMs } = getSettings();
+        const level = typeof frame === 'number' ? frame : frame.level;
+        const flatness = typeof frame === 'number' ? null : frame.flatness;
 
         levels.push(level === -Infinity ? -100 : level);
         if (levels.length > HISTORY_FRAMES) levels.shift();
@@ -86,12 +158,32 @@ var SilenceSkip = (() => {
         if (now - lastRecalc >= RECALC_EVERY_MS && levels.length >= MIN_SAMPLES) {
           lastRecalc = now;
           const sorted = [...levels].sort((a, b) => a - b);
-          threshold = sorted[Math.floor(sorted.length * 0.9)] - silenceMarginDb;
+          threshold = at(sorted, 0.9) - silenceMarginDb;
         }
 
         if (threshold === -Infinity) return false; // still learning this video
 
-        if (level < threshold) {
+        // Level alone cannot tell a quiet room from a loud one. A kitchen, a
+        // car, an air conditioner or a crowd can sit close enough to the
+        // speaking level that nothing ever falls under the threshold, and a
+        // stretch with nobody talking in it plays out in full at 1x.
+        //
+        // Two things separate that from actual speech, and both are already in
+        // the spectrum we are reading. Speech is *modulated*: syllables push the
+        // band up and down by a wide margin several times a second, while
+        // ambience holds a near-constant level. And speech is *peaky*: voiced
+        // sound is a pitch plus its harmonics under a couple of formants, where
+        // broadband noise spreads evenly. Neither is conclusive alone - a held
+        // note is unmodulated, a hiss can be brief - so a frame is only demoted
+        // to ambience when it fails both at once.
+        let ambient = false;
+        if (flatness !== null && levels.length >= MOD_WINDOW_FRAMES) {
+          const recent = levels.slice(-MOD_WINDOW_FRAMES).sort((a, b) => a - b);
+          const modulation = at(recent, 0.9) - at(recent, 0.1);
+          ambient = modulation < AMBIENT_MOD_MAX_DB && flatness > AMBIENT_FLATNESS_MIN;
+        }
+
+        if (level < threshold || ambient) {
           if (quietSince === 0) quietSince = now;
           // Wait out short gaps so we do not flip speed between words.
           if (now - quietSince >= silenceHoldMs) fast = true;
@@ -127,6 +219,11 @@ var SilenceSkip = (() => {
   let rateWeSet = null;
   let deadFrames = 0;
   let badge = null;
+
+  // Live-stream state for the currently attached element.
+  let live = false;
+  let durationSeen = 0;
+  let durationGrowths = 0;
 
   // -------------------------------------------------------------------------
   // Safety gates
@@ -174,6 +271,74 @@ var SilenceSkip = (() => {
     return ctx.state === 'running';
   }
 
+  /**
+   * True while the attached element is playing a live stream.
+   *
+   * Speeding up a live stream is not a milder version of speeding up a
+   * recording, it is a different thing entirely. A recording is already on its
+   * way down the wire, so spending buffer faster than real time costs nothing. A
+   * live stream only contains what has already been broadcast: it produces one
+   * second of media per second, and any rate above 1x borrows against the live
+   * edge until there is nothing left to play. The player then stalls, buffers,
+   * and hands back a few seconds - which arrive as digital silence, which reads
+   * as "nobody is talking", which speeds it up again. That loop is why a quiet
+   * moment in a live stream turned into permanent rebuffering.
+   *
+   * There is no setting for this. Nothing about a live stream makes speeding it
+   * up work, so there is nothing for a user to decide.
+   */
+  function isLive(el) {
+    if (!el) return false;
+    // Streams with no known end - the common case - report Infinity here.
+    if (!Number.isFinite(el.duration)) return true;
+    // DVR live streams report the seekable window instead, which is finite, so
+    // they are caught by the player's own marker or by the window growing.
+    return live || Boolean(hooks.isLive(el));
+  }
+
+  /**
+   * A live window creeps forward while the broadcast runs. A recording settles
+   * its duration in one or two jumps as the manifest loads and then holds, so it
+   * is the repetition of small steps rather than any single one that gives a
+   * stream away.
+   */
+  function onDurationChange() {
+    if (!video) return;
+    const current = video.duration;
+    if (!Number.isFinite(current)) return; // isLive() reads this directly
+    const grew = current - durationSeen;
+    if (durationSeen > 0 && grew > 0.5 && grew < 30 && video.currentTime > 10) {
+      if (++durationGrowths >= LIVE_GROWTH_EVENTS) live = true;
+    }
+    durationSeen = Math.max(durationSeen, current);
+  }
+
+  /** Seconds of already-downloaded media sitting ahead of the playhead. */
+  function bufferAhead(el) {
+    const { buffered } = el;
+    for (let i = 0; i < buffered.length; i++) {
+      if (buffered.start(i) <= el.currentTime && el.currentTime <= buffered.end(i)) {
+        return buffered.end(i) - el.currentTime;
+      }
+    }
+    return 0;
+  }
+
+  /**
+   * Is there enough downloaded media ahead to spend it faster than it arrives?
+   *
+   * The tail of a video is exempt: once everything left is buffered there is
+   * nothing to run out of, and without this the last few seconds of every video
+   * would refuse to speed up.
+   */
+  function bufferHealthy(el) {
+    const ahead = bufferAhead(el);
+    const floor = engaged ? RELEASE_MIN_BUFFER_SEC : ENGAGE_MIN_BUFFER_SEC;
+    if (ahead >= floor) return true;
+    const remaining = Number.isFinite(el.duration) ? el.duration - el.currentTime : Infinity;
+    return ahead >= remaining - 0.5;
+  }
+
   function canEngage(el) {
     if (!settings.skipSilence || disabledReason) return false;
     if (!el || el.paused || el.ended || el.seeking) return false;
@@ -181,6 +346,7 @@ var SilenceSkip = (() => {
     // everything. content.js mutes briefly during its autoplay fallback.
     if (el.muted || el.volume === 0) return false;
     if (hooks.isAd()) return false;
+    if (isLive(el)) return false;
     return true;
   }
 
@@ -230,6 +396,7 @@ var SilenceSkip = (() => {
       /* older engines */
     }
     el.addEventListener('ratechange', onRateChange);
+    el.addEventListener('durationchange', onDurationChange);
     el.addEventListener('loadstart', resetMeasurements);
     el.addEventListener('emptied', resetMeasurements);
     return true;
@@ -239,29 +406,49 @@ var SilenceSkip = (() => {
     if (!video) return;
     release();
     video.removeEventListener('ratechange', onRateChange);
+    video.removeEventListener('durationchange', onDurationChange);
     video.removeEventListener('loadstart', resetMeasurements);
     video.removeEventListener('emptied', resetMeasurements);
     video = null;
   }
 
-  /** Mean power in the speech band, in dB. -Infinity means digital silence. */
-  function speechBandLevel() {
+  /**
+   * One frame of the speech band: how loud it is, and how evenly the energy is
+   * spread across it.
+   *
+   * `level` is mean power in dB, -Infinity for digital silence. `flatness` is
+   * the Wiener entropy - geometric mean over arithmetic mean - which runs from
+   * near 0 for a few strong peaks (a voice) to 1 for white noise (a room).
+   */
+  function analyseFrame() {
     analyser.getFloatFrequencyData(bins);
     let power = 0;
+    let logPower = 0;
     let counted = 0;
     for (let i = bandLo; i <= bandHi; i++) {
       const db = bins[i];
       if (db === -Infinity) continue;
-      power += Math.pow(10, db / 10);
+      const binPower = Math.pow(10, db / 10);
+      power += binPower;
+      logPower += Math.log(binPower);
       counted++;
     }
-    if (counted === 0) return -Infinity;
-    return 10 * Math.log10(power / counted);
+    if (counted === 0) return { level: -Infinity, flatness: 1 };
+    const mean = power / counted;
+    return {
+      level: 10 * Math.log10(mean),
+      flatness: Math.exp(logPower / counted) / mean,
+    };
   }
 
   function resetMeasurements() {
     decider.reset();
     deadFrames = 0;
+    // A player that reuses one element can go from a live stream to a recording
+    // and back, so what was learned about the last one is thrown away with it.
+    live = false;
+    durationSeen = Number.isFinite(video?.duration) ? video.duration : 0;
+    durationGrowths = 0;
   }
 
   // -------------------------------------------------------------------------
@@ -344,14 +531,9 @@ var SilenceSkip = (() => {
   function tick() {
     // An orphaned copy left behind by an extension reload must not keep an
     // animation loop alive in the page forever.
-    try {
-      if (!chrome.runtime?.id) {
-        rafId = null;
-        release();
-        return;
-      }
-    } catch {
+    if (!contextAlive()) {
       rafId = null;
+      release();
       return;
     }
 
@@ -379,10 +561,23 @@ var SilenceSkip = (() => {
 
     if (!canEngage(video)) {
       release();
+      // A live stream or an ad break is not a silence to be counted; the gap
+      // after it starts from scratch.
+      decider.standDown();
       return;
     }
 
-    const level = speechBandLevel();
+    // A video that has run out of buffer produces nothing, and nothing reads as
+    // silence. Left alone the decider would call a rebuffer "quiet", speed up,
+    // drain whatever came back, and stall again. Stand down until there is
+    // enough media ahead to spend.
+    if (video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA || !bufferHealthy(video)) {
+      release();
+      decider.standDown();
+      return;
+    }
+
+    const { level, flatness } = analyseFrame();
 
     // Guard against a graph that is silently producing nothing - without this
     // we would read permanent silence and blast through the whole video.
@@ -396,7 +591,7 @@ var SilenceSkip = (() => {
       deadFrames = 0;
     }
 
-    if (decider.push(level, now)) engage();
+    if (decider.push({ level, flatness }, now)) engage();
     else release();
 
     if (engaged) showBadge(video.playbackRate);
@@ -410,15 +605,11 @@ var SilenceSkip = (() => {
   // Public surface
   // -------------------------------------------------------------------------
 
-  return {
+  const api = {
     init(injected) {
       hooks = { ...hooks, ...injected };
       // An orphaned copy throws on every chrome.* call; it has no work to do.
-      try {
-        if (!chrome.runtime?.id) return;
-      } catch {
-        return;
-      }
+      if (!contextAlive()) return;
       chrome.storage.local.get(DEFAULTS).then((stored) => {
         settings = stored;
         start();
@@ -448,10 +639,16 @@ var SilenceSkip = (() => {
         active: Boolean(video && analyser) && !disabledReason,
         engaged,
         disabledReason,
+        // Not a disabledReason: it belongs to this video, not this page, and
+        // clears by itself when the player moves on to a recording.
+        live: isLive(video),
       };
     },
 
     /** Exposed for test/decider.test.js. Not part of the runtime surface. */
     _createDecider: createDecider,
   };
+
+  globalThis.__tabRunnerSilence = api;
+  return api;
 })();
